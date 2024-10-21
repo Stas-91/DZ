@@ -1,0 +1,80 @@
+---
+- name: Install and configure RabbitMQ cluster using the correct network interface
+  hosts: rabbitmq_nodes
+  become: true
+  vars:
+    rabbitmq_version: "3.10.7"
+    erlang_cookie: "supersecretcookie"
+    rabbitmq_user: "test"
+    rabbitmq_password: "test"
+    # Укажи нужный интерфейс для извлечения IP
+    rabbitmq_network_interface: "enp0s3"
+
+  tasks:
+    - name: Install required dependencies
+      apt:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - erlang-nox
+        - socat
+        - rabbitmq-server
+
+    - name: Set the correct IP from the specified network interface
+      set_fact:
+        rabbitmq_node_ip: "{{ hostvars[inventory_hostname]['ansible_' + rabbitmq_network_interface].ipv4.address }}"
+
+    - name: Configure RabbitMQ to use IP address as node name
+      copy:
+        content: |
+          RABBITMQ_NODENAME=rabbit@{{ rabbitmq_node_ip }}
+          RABBITMQ_USE_LONGNAME=true
+        dest: /etc/rabbitmq/rabbitmq-env.conf
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0644'
+
+    - name: Set Erlang cookie for clustering
+      copy:
+        content: "{{ erlang_cookie }}"
+        dest: /var/lib/rabbitmq/.erlang.cookie
+        owner: rabbitmq
+        group: rabbitmq
+        mode: '0600'
+
+    - name: Restart RabbitMQ to apply new configuration
+      systemd:
+        name: rabbitmq-server
+        state: restarted
+
+    - name: Enable RabbitMQ management plugin
+      command: rabbitmq-plugins enable rabbitmq_management
+      ignore_errors: yes
+
+    - name: Add RabbitMQ user
+      command: rabbitmqctl add_user {{ rabbitmq_user }} {{ rabbitmq_password }}
+      ignore_errors: yes
+
+    - name: Set RabbitMQ user tags
+      command: rabbitmqctl set_user_tags {{ rabbitmq_user }} administrator
+      ignore_errors: yes
+
+    - name: Set RabbitMQ user permissions
+      command: rabbitmqctl set_permissions -p / {{ rabbitmq_user }} ".*" ".*" ".*"
+      ignore_errors: yes
+
+    - name: Stop RabbitMQ app (on secondary nodes)
+      when: inventory_hostname != groups['rabbitmq_nodes'][0]
+      command: rabbitmqctl stop_app
+
+    - name: Join cluster (on secondary nodes)
+      when: inventory_hostname != groups['rabbitmq_nodes'][0]
+      command: rabbitmqctl join_cluster rabbit@{{ hostvars[groups['rabbitmq_nodes'][0]].rabbitmq_node_ip }}
+
+    - name: Start RabbitMQ app (on secondary nodes)
+      when: inventory_hostname != groups['rabbitmq_nodes'][0]
+      command: rabbitmqctl start_app
+
+    - name: Set ha-all policy on master node
+      when: inventory_hostname == groups['rabbitmq_nodes'][0]
+      command: rabbitmqctl set_policy ha-all "" '{"ha-mode":"all"}'
